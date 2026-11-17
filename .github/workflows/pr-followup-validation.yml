@@ -22,7 +22,7 @@ jobs:
       matrix:
         include:
           - pr: "727"
-            head: "fd2eb961b96008aa162b7f78629a5abcc4707ab4"
+            head: "88705de6f0ffc43134f3c1edb5664d07ae4dd648"
             previous: "f9cae8af10fc77df69615c3412c9611e6cbb3c66"
             source: src/skillevaluator/tier3/eval_core/declarative_checks.py
             regression_file: tests/tier3/test_quoted_script_status.py
@@ -34,22 +34,6 @@ jobs:
               tests/tier3/test_declarative_checks.py
               tests/tier3/test_script_invocation_evidence.py
               tests/tier3/test_shell_lexing.py
-          - pr: "731"
-            head: "be53ef1a710a8cef7e3099596201e9cccbabc164"
-            previous: "a3f7797958eb849f134935b94cf942361e088032"
-            source: src/skillevaluator/tier3/eval_core/plugin_signals.py
-            regression_file: tests/tier3/test_codex_mcp_identity.py
-            regression: test_native_mcp_report_validates_identity_before_truncating_labels
-            expected_tests: "2"
-            expected_failures: "1"
-            suites: >-
-              tests/tier3/test_codex_mcp_identity.py
-              tests/tier3/test_log_converters.py
-              tests/tier3/test_plugin_signals.py
-              tests/tier3/test_codex_tool_call_normalization.py
-              tests/tier3/test_tool_productivity.py
-              tests/tier3/test_root_search_efficiency.py
-              tests/tier3/test_shared_check_adapters.py
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
         with:
