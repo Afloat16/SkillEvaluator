@@ -1,0 +1,67 @@
+name: Gym ingestion Python compatibility
+
+on:
+  push:
+    branches: ["validation/20261126-skillevaluator-gym-python"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  focused:
+    name: Gym ingestion (Python ${{ matrix.python }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
+    env:
+      TMPDIR: /tmp
+      TARGET_SHA: 06ec024612e4df7b1c9865e51db643c8954c3905
+    steps:
+      - name: Check out exact followup head
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          repository: Afloat16/SkillEvaluator
+          ref: 06ec024612e4df7b1c9865e51db643c8954c3905
+          persist-credentials: false
+      - name: Verify immutable source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          git log -1 --format=fuller
+          test -d /tmp && test -w /tmp
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Set up uv 0.13.8
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3
+        with:
+          version: "0.13.8"
+      - name: Install locked project extras
+        shell: bash
+        env:
+          PYTHON_VERSION: ${{ matrix.python }}
+        run: |
+          set -euo pipefail
+          uv sync --all-extras --locked --python "$PYTHON_VERSION"
+          .venv/bin/python --version
+      - name: Run focused ingestion regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          .venv/bin/python -m pytest -q \
+            tests/tier3/test_gym_rollout_streaming.py \
+            tests/test_nemo_gym_backend.py::test_truncated_rollout_line_is_skipped_and_reported \
+            tests/test_nemo_gym_backend.py::test_rollout_reader_splits_only_on_newlines
+      - name: Check lint and formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          make PYTHON="$GITHUB_WORKSPACE/.venv/bin/python" lint
+          .venv/bin/python -m ruff format --check tests/tier3/test_gym_rollout_streaming.py
+          git diff --check
