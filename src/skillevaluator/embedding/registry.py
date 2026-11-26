@@ -22,6 +22,7 @@ import unicodedata
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from io import BytesIO
 from itertools import combinations
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlsplit
@@ -608,12 +609,27 @@ class EmbeddingRegistry:
             "endpoint_fingerprint": _client_endpoint_fingerprint(self._client),
             "vector_dimension": vector_dimension,
             "created_at": datetime.now(tz=UTC).isoformat(),
-            "entries": entries,
         }
-        serialized = json.dumps(data, separators=(",", ":"), allow_nan=False) + "\n"
-        if len(serialized.encode("utf-8")) > MAX_CATALOG_BYTES:
-            raise ValueError(f"Catalog size limit exceeded ({MAX_CATALOG_BYTES} bytes)")
-        _write_catalog_atomically(catalog_path, serialized.encode("utf-8"))
+        encoder = json.JSONEncoder(separators=(",", ":"), allow_nan=False)
+        with BytesIO() as payload:
+
+            def append(text: str) -> None:
+                encoded = text.encode("utf-8")
+                if payload.tell() + len(encoded) > MAX_CATALOG_BYTES:
+                    raise ValueError(f"Catalog size limit exceeded ({MAX_CATALOG_BYTES} bytes)")
+                payload.write(encoded)
+
+            append(encoder.encode(data)[:-1])
+            append(',"entries":[')
+            # Each entry is independently bounded by its text/vector limits.
+            # Keep the C encoder's compact formatting, but stop before encoding
+            # the remaining entries once their accumulated bytes exceed the cap.
+            for index, entry in enumerate(entries):
+                if index:
+                    append(",")
+                append(encoder.encode(entry))
+            append("]}\n")
+            _write_catalog_atomically(catalog_path, payload.getvalue())
         logger.debug("Saved local catalog to %s (%d entries)", safe_path_label(catalog_path), len(self._entries))
 
     def load_catalog(self, catalog_path: Path) -> None:

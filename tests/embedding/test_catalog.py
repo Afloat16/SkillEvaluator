@@ -78,6 +78,7 @@ class TestCatalogPersistence:
         data = _catalog_data()
         data["vector_dimension"] = 128
         data["entries"][0]["embedding"] = [(index + 1) / 129 for index in range(128)]
+        data["entries"][0]["description"] = 'Catalog description: "quoted" and \u4e2d\u6587\n'
         registry = EmbeddingRegistry(_client())
         registry.load_catalog(_write_catalog(tmp_path / "input.json", data))
         clock = MagicMock(wraps=registry_module.datetime)
@@ -90,6 +91,7 @@ class TestCatalogPersistence:
         output = tmp_path / "output.json"
         registry.save_catalog(output)
         encoded = output.read_bytes()
+        assert encoded == (json.dumps(data, separators=(",", ":"), allow_nan=False) + "\n").encode("utf-8")
         assert len(encoded) < indented_bytes
         assert json.loads(encoded)["entries"] == data["entries"]
 

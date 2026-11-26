@@ -36,6 +36,10 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ### Fixed
 
+- Saving a Tier 2 embedding catalog checks the byte budget after each encoded
+  entry, so an oversized catalog no longer allocates its entire JSON document
+  before failing. Compact output, the 32 MiB limit, and atomic replacement are
+  unchanged.
 - `make lint` checks the whole repository, as CI does, instead of only `src` and `tests`, so a
   lint error in `scripts/` or `ci/` no longer passes the documented local gate and then fails CI.
 - Tier 2 deduplication verdict requests carry the documented output ceiling,
