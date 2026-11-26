@@ -2,7 +2,7 @@ name: SkillEvaluator contribution preflight
 
 on:
   push:
-    branches: ["validation/20261126-skillevaluator-shell-budget"]
+    branches: ["validation/20261126-skillevaluator-review-followups"]
   workflow_dispatch:
 
 permissions:
@@ -17,8 +17,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - id: shell-budget
-            sha: 05206229fa66086d28c4465b2fac8b6485919de5
+          - id: pr-908
+            sha: 6375935ecd99128fb37a32f5fb6b5195ad44184f
+          - id: pr-909
+            sha: 451548d5c6879fb211f8a8965ec1eb9ea9616d26
+          - id: pr-910
+            sha: 3a82406152888bd296f22d832c8ead22a408d5f5
+          - id: pr-912
+            sha: 923fa01ec335e5fcfb6299a7d5a040e794f7a24b
+          - id: pr-913
+            sha: f9f39d1f4ab012de304b2f35339d1dd8750b2376
     env:
       TMPDIR: /tmp
       GATE_LOG_DIR: /tmp/skillevaluator-preflight
