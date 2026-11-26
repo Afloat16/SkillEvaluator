@@ -36,6 +36,10 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ### Fixed
 
+- NeMo Gym staging edits actual `task.toml` fields through decoded TOML paths.
+  Quoted and dotted keys and inline environment/verifier tables no longer leave
+  rejected `skills_dir` hooks or break timeout, resource, and judge overrides.
+  Instruction examples, comments, and unrelated metadata stay unchanged.
 - `make lint` checks the whole repository, as CI does, instead of only `src` and `tests`, so a
   lint error in `scripts/` or `ci/` no longer passes the documented local gate and then fails CI.
 - Tier 2 deduplication verdict requests carry the documented output ceiling,

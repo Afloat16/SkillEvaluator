@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import signal
@@ -67,9 +68,6 @@ SANDBOX_ENV = "SKILL_EVAL_NEMO_GYM_SANDBOX"
 HOST_ENV = "SKILL_EVAL_NEMO_GYM_HOST"
 
 
-_SKILLS_DIR_LINE = re.compile(r"^skills_dir\s*=.*\n?", re.MULTILINE)
-
-
 def stage_for_gym(
     arm_dir: Path,
     verifier_env: dict[str, str] | None = None,
@@ -104,37 +102,18 @@ def stage_for_gym(
                 docker_text = dockerfile.read_text(encoding="utf-8")
                 if not docker_text.rstrip().endswith("\n" + projection):
                     dockerfile.write_text(docker_text.rstrip("\n") + "\n" + projection + "\n", encoding="utf-8")
-        staged = _SKILLS_DIR_LINE.sub("", text)
-        existing = set((tomllib.loads(staged).get("verifier") or {}).get("env") or {})
-        lines = "".join(
-            f"{json.dumps(name)} = {json.dumps(value)}\n"
-            for name, value in sorted((verifier_env or {}).items())
-            if name not in existing
-        )
-        if lines:
-            if not staged.endswith("\n"):
-                staged += "\n"
-            added = set(verifier_env or {}) - existing
-            for header in re.finditer(
-                r"^[ \t]*\[[ \t]*verifier[ \t]*\.[ \t]*env[ \t]*\][ \t]*(?:#[^\n]*)?\n", staged, re.MULTILINE
-            ):
-                # A header-like line can also sit inside a multiline string: keep the real table.
-                candidate = staged[: header.end()] + lines + staged[header.end() :]
-                try:
-                    candidate_env = (tomllib.loads(candidate).get("verifier") or {}).get("env") or {}
-                except tomllib.TOMLDecodeError:
-                    continue
-                if added <= set(candidate_env):
-                    staged = candidate
-                    break
-            else:
-                staged = staged.rstrip("\n") + "\n\n[verifier.env]\n" + lines
+        staged = _drop_table_key(text, "", "skills_dir", task_file=task_toml)
+        staged = _drop_table_key(staged, "environment", "skills_dir", task_file=task_toml)
+        if verifier_env:
+            staged = _set_task_table_values(
+                staged, ("verifier", "env"), dict(sorted(verifier_env.items())), only_missing=True, task_file=task_toml
+            )
         if timeout_multiplier != 1.0:
             staged = _scaled_task_timeouts(staged, timeout_multiplier, task_file=task_toml)
             # Harbor's multiplier also scales the verifier's 600 s default.
-            staged = _set_table_numbers(
+            staged = _set_task_table_values(
                 staged,
-                "verifier",
+                ("verifier",),
                 {"timeout_sec": _DEFAULT_VERIFIER_TIMEOUT_SEC * timeout_multiplier},
                 only_missing=True,
                 task_file=task_toml,
@@ -143,7 +122,7 @@ def stage_for_gym(
             if "memory_mb" in resource_overrides:
                 # Harbor's deprecated `memory = "4G"` would conflict with the overriding memory_mb.
                 staged = _drop_table_key(staged, "environment", "memory", task_file=task_toml)
-            staged = _set_table_numbers(staged, "environment", resource_overrides, task_file=task_toml)
+            staged = _set_task_table_values(staged, ("environment",), resource_overrides, task_file=task_toml)
         if staged != text:
             task_toml.write_text(staged, encoding="utf-8")
 
@@ -159,130 +138,191 @@ _TIMEOUT_FIELDS = {
 _DEFAULT_BUILD_TIMEOUT_SEC = 600.0
 # Harbor's VerifierConfig.timeout_sec default.
 _DEFAULT_VERIFIER_TIMEOUT_SEC = 600.0
-_TRIPLE_QUOTES = ('"' * 3, "'" * 3)
-_TABLE_RE = re.compile(r"^[ \t]*\[{1,2}[ \t]*([A-Za-z0-9_.-]+)[ \t]*\]{1,2}[ \t]*(?:#.*)?$")
-_NUMBER_RE = re.compile(r"^([ \t]*)([A-Za-z_]+)([ \t]*=[ \t]*)([0-9][0-9_.eE+-]*)([ \t]*(?:#.*)?)$")
+_TASK_SCALAR_RE = re.compile(r"[^\s,#}\]]+")
+
+
+def _edited_task_toml(text: str, edits: list[tuple[int, int, str]]) -> str:
+    """Apply disjoint source spans without moving the spans still to be edited."""
+    pieces = []
+    previous = 0
+    for start, end, replacement in sorted(edits):
+        pieces.extend((text[previous:start], replacement))
+        previous = end
+    pieces.append(text[previous:])
+    return "".join(pieces)
+
+
+def _task_value_end(text: str, start: int) -> int:
+    from skillevaluator.tier3.harbor.adapter import _skip_toml_string_literal
+
+    if text[start : start + 1] in {"'", '"'}:
+        return _skip_toml_string_literal(text, start)
+    scalar = _TASK_SCALAR_RE.match(text, start)
+    if scalar is None:
+        raise ValueError("Cannot locate a scalar task.toml value")
+    return scalar.end()
+
+
+def _same_task_values(actual: Any, expected: Any) -> bool:
+    """Compare parsed TOML values, including unrelated NaNs in free-form metadata."""
+    pending = [(actual, expected)]
+    while pending:
+        actual, expected = pending.pop()
+        if isinstance(expected, dict):
+            if not isinstance(actual, dict) or actual.keys() != expected.keys():
+                return False
+            pending.extend((actual[key], value) for key, value in expected.items())
+        elif isinstance(expected, list):
+            if not isinstance(actual, list) or len(actual) != len(expected):
+                return False
+            pending.extend(zip(actual, expected, strict=True))
+        elif actual != expected and not (
+            isinstance(actual, float) and isinstance(expected, float) and math.isnan(actual) and math.isnan(expected)
+        ):
+            return False
+    return True
 
 
 def _scaled_task_timeouts(text: str, multiplier: float, *, task_file: Path) -> str:
     """Scale a staged task.toml's timeouts by Harbor's multiplier, checking nothing else changed."""
+    from skillevaluator.tier3.harbor.adapter import _iter_toml_constructs, _TomlTableHeader
     from skillevaluator.tier3.harbor.runner import _scaled_harbor_timeout
 
-    lines = text.split("\n")
-    table = ""
-    open_string: str | None = None
-    build_timeout_seen = False
-    environment_end: int | None = None
-    for index, line in enumerate(lines):
-        if open_string is not None:
-            if line.count(open_string) % 2:
-                open_string = None
-            continue
-        header = _TABLE_RE.match(line)
-        if header:
-            if table == "environment" and environment_end is None:
-                environment_end = index
-            table = header.group(1)
-            continue
-        number = _NUMBER_RE.match(line)
-        if number and _TIMEOUT_FIELDS.get(table) == number.group(2):
-            field = f"{table}.{number.group(2)}"
-            scaled = _scaled_harbor_timeout(number.group(4), multiplier, task_file=task_file, field=field)
-            build_timeout_seen = build_timeout_seen or table == "environment"
-            lines[index] = f"{number.group(1)}{number.group(2)}{number.group(3)}{scaled!r}{number.group(5)}"
-            continue
-        open_string = next((quote for quote in ('"""', "'''") if line.count(quote) % 2), None)
-    if table == "environment" and environment_end is None:
-        environment_end = len(lines)
     expected = tomllib.loads(text)
+    targets = {(*table.split("."), field) for table, field in _TIMEOUT_FIELDS.items()}
+    edits: list[tuple[int, int, str]] = []
+    in_step = False
+    for construct in _iter_toml_constructs(text):
+        if isinstance(construct, _TomlTableHeader):
+            in_step = construct.is_array_table and construct.table_parts == ("steps",)
+            continue
+        path = construct.full_path
+        if in_step and path[:1] == ("[[steps]]",):
+            path = ("steps", *path[1:])
+        if path not in targets:
+            continue
+        end = _task_value_end(text, construct.val_start)
+        number = tomllib.loads("value = " + text[construct.val_start : end])["value"]
+        if type(number) not in (int, float):
+            raise ValueError(f"{task_file}: could not apply --timeout-multiplier to the task timeouts")
+        scaled = _scaled_harbor_timeout(number, multiplier, task_file=task_file, field=".".join(path))
+        edits.append((construct.val_start, end, repr(scaled)))
     _scale_timeout_values(expected, multiplier)
-    if not build_timeout_seen and environment_end is not None:
-        while environment_end > 0 and not lines[environment_end - 1].strip():
-            environment_end -= 1
-        lines.insert(environment_end, f"build_timeout_sec = {_DEFAULT_BUILD_TIMEOUT_SEC * multiplier!r}")
+    staged = _edited_task_toml(text, edits)
+    if isinstance(expected.get("environment"), dict) and "build_timeout_sec" not in expected["environment"]:
+        staged = _set_task_table_values(
+            staged,
+            ("environment",),
+            {"build_timeout_sec": _DEFAULT_BUILD_TIMEOUT_SEC * multiplier},
+            only_missing=True,
+            task_file=task_file,
+        )
         expected["environment"]["build_timeout_sec"] = _DEFAULT_BUILD_TIMEOUT_SEC * multiplier
-    staged = "\n".join(lines)
-    if tomllib.loads(staged) != expected:
+    if not _same_task_values(tomllib.loads(staged), expected):
         raise ValueError(f"{task_file}: could not apply --timeout-multiplier to the task timeouts")
     return staged
 
 
-_KEY_RE = re.compile(r"^[ \t]*([A-Za-z0-9_-]+)[ \t]*=")
-
-
 def _drop_table_key(text: str, table_name: str, key: str, *, task_file: Path) -> str:
-    """Remove a single-line ``key = value`` from one top-level task.toml table, checking nothing else changed."""
+    """Remove one scalar assignment from its decoded table path, never from an example string."""
+    from skillevaluator.tier3.harbor.adapter import _iter_toml_constructs, _TomlKeyAssignment
+
     expected = tomllib.loads(text)
-    table_data = expected.get(table_name)
+    table_data = expected.get(table_name) if table_name else expected
     if not isinstance(table_data, dict) or key not in table_data:
         return text
     del table_data[key]
-    lines = text.split("\n")
-    table = ""
-    for index, line in enumerate(lines):
-        header = _TABLE_RE.match(line)
-        if header:
-            table = header.group(1)
+    target = (table_name, key) if table_name else (key,)
+    staged = text
+    for construct in _iter_toml_constructs(text):
+        if not isinstance(construct, _TomlKeyAssignment) or construct.full_path != target:
             continue
-        match = _KEY_RE.match(line)
-        if table == table_name and match and match.group(1) == key:
-            del lines[index]
-            break
-    staged = "\n".join(lines)
-    if tomllib.loads(staged) != expected:
+        start, end = construct.key_start, _task_value_end(text, construct.val_start)
+        if construct.scope_stack:
+            after = end
+            while after < len(text) and text[after] in " \t":
+                after += 1
+            if text[after : after + 1] == ",":
+                end = after + 1
+            else:
+                before = start - 1
+                while before >= 0 and text[before] in " \t":
+                    before -= 1
+                if text[before : before + 1] == ",":
+                    start = before
+        replacement = ""
+        if table_name and not table_data and not construct.current_table and not construct.scope_stack:
+            # Keep the now-empty table when its only definition was a dotted key.
+            replacement = f"{table_name} = {{}}"
+        staged = text[:start] + replacement + text[end:]
+        break
+    if not _same_task_values(tomllib.loads(staged), expected):
         raise ValueError(f"{task_file}: could not replace [{table_name}] {key} with the override")
     return staged
 
 
-def _set_table_numbers(
-    text: str, table_name: str, values: dict[str, Any], *, only_missing: bool = False, task_file: Path
+def _set_task_table_values(
+    text: str, table: tuple[str, ...], values: dict[str, Any], *, only_missing: bool = False, task_file: Path
 ) -> str:
-    """Set numeric keys of one top-level task.toml table, adding the keys or the table when absent."""
-    lines = text.split("\n")
-    table = ""
-    open_string: str | None = None
-    seen: set[str] = set()
-    table_end: int | None = None
-    for index, line in enumerate(lines):
-        if open_string is not None:
-            if line.count(open_string) % 2:
-                open_string = None
-            continue
-        header = _TABLE_RE.match(line)
-        if header:
-            if table == table_name and table_end is None:
-                table_end = index
-            table = header.group(1)
-            continue
-        number = _NUMBER_RE.match(line)
-        if table == table_name and number and number.group(2) in values:
-            seen.add(number.group(2))
-            if not only_missing:
-                value = values[number.group(2)]
-                lines[index] = f"{number.group(1)}{number.group(2)}{number.group(3)}{value!r}{number.group(5)}"
-            continue
-        open_string = next((quote for quote in _TRIPLE_QUOTES if line.count(quote) % 2), None)
-    if table == table_name and table_end is None:
-        table_end = len(lines)
+    """Set scalar keys at a decoded table path while preserving all other source text and values."""
+    from skillevaluator.tier3.harbor.adapter import _iter_toml_constructs, _TomlKeyAssignment, _TomlTableHeader
+
     expected = tomllib.loads(text)
-    current = expected.setdefault(table_name, {})
-    if not isinstance(current, dict):
-        raise ValueError(f"{task_file}: [{table_name}] is not a table")
-    missing = {key: value for key, value in values.items() if key not in current and key not in seen}
+    current = expected
+    table_name = ".".join(table)
+    for part in table:
+        current = current.setdefault(part, {})
+        if not isinstance(current, dict):
+            raise ValueError(f"{task_file}: [{table_name}] is not a table")
+    missing = {key: value for key, value in values.items() if key not in current}
+    edits: list[tuple[int, int, str]] = []
+    insertion = (0, table)
+    inline: tuple[int, tuple[str, ...]] | None = None
+
+    def literal(value: Any) -> str:
+        return json.dumps(value) if isinstance(value, str) else repr(value)
+
+    for construct in _iter_toml_constructs(text):
+        if isinstance(construct, _TomlTableHeader):
+            prefix = construct.table_parts
+            if (
+                not construct.is_array_table
+                and table[: len(prefix)] == prefix
+                and len(prefix) >= len(table) - len(insertion[1])
+            ):
+                insertion = (min(construct.line_end + 1, len(text)), table[len(prefix) :])
+        elif isinstance(construct, _TomlKeyAssignment):
+            prefix = construct.full_path
+            if table[: len(prefix)] == prefix and text[construct.val_start : construct.val_start + 1] == "{":
+                inline = (construct.val_start + 1, table[len(prefix) :])
+            if not only_missing and construct.full_path[:-1] == table and construct.full_path[-1] in values:
+                edits.append(
+                    (
+                        construct.val_start,
+                        _task_value_end(text, construct.val_start),
+                        literal(values[construct.full_path[-1]]),
+                    )
+                )
+    if missing:
+        position, remaining = inline if inline is not None else insertion
+        assignments = []
+        for key, value in missing.items():
+            path = ".".join(
+                part if re.fullmatch(r"[A-Za-z0-9_-]+", part) else json.dumps(part) for part in (*remaining, key)
+            )
+            assignments.append(f"{path} = {literal(value)}")
+        if inline is not None:
+            empty = text[position:].lstrip().startswith("}")
+            added = " " + ", ".join(assignments) + (" " if empty else ",")
+        else:
+            prefix = "\n" if position and not text[:position].endswith("\n") else ""
+            added = prefix + "\n".join(assignments) + "\n"
+        edits.append((position, position, added))
     for key, value in values.items():
         if key in missing or not only_missing:
             current[key] = value
-    added = [f"{key} = {value!r}" for key, value in missing.items()]
-    if added:
-        if table_end is None:
-            body = lines[:-1] if lines and lines[-1] == "" else lines
-            lines = [*body, "", f"[{table_name}]", *added, ""]
-        else:
-            while table_end > 0 and not lines[table_end - 1].strip():
-                table_end -= 1
-            lines[table_end:table_end] = added
-    staged = "\n".join(lines)
-    if tomllib.loads(staged) != expected:
+    staged = _edited_task_toml(text, edits)
+    if not _same_task_values(tomllib.loads(staged), expected):
         raise ValueError(f"{task_file}: could not set [{table_name}] {', '.join(values)} in the task")
     return staged
 
