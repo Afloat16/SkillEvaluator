@@ -1,0 +1,152 @@
+name: SkillEvaluator SDK initialization preflight
+
+on:
+  push:
+    branches: ["validation/20261126-skillevaluator-sdk-init"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gates:
+    name: Three required gates (${{ matrix.id }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: sdk-initialization
+            sha: 098d6a3f4474c54eba52223f3e99a7e065efe437
+    env:
+      TMPDIR: /tmp
+      GATE_LOG_DIR: /tmp/skillevaluator-preflight
+    steps:
+      - name: Check out exact contribution head
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0, matching upstream
+        with:
+          repository: Afloat16/SkillEvaluator
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - name: Verify immutable source and standard temporary directory
+        id: identity
+        env:
+          TARGET_SHA: ${{ matrix.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GATE_LOG_DIR"
+          actual_sha="$(git rev-parse HEAD)"
+          test "$actual_sha" = "$TARGET_SHA"
+          test -d /tmp && test -w /tmp
+          echo "sha=$actual_sha" >> "$GITHUB_OUTPUT"
+          {
+            git log -1 --format=fuller
+            uname -a
+            command -v make
+          } > "$GATE_LOG_DIR/source-and-runner.txt"
+      - name: Set up Python 3.12
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0, matching upstream
+        with:
+          python-version: "3.12"
+      - name: Set up Node.js for the existing JavaScript tests
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0, matching upstream
+        with:
+          node-version: "22"
+      - name: Set up uv 0.13.8
+        uses: astral-sh/setup-uv@d31148d669074a8d0a63714ba94f3201e7020bc3 # v8.3.0, matching upstream
+        with:
+          version: "0.13.8"
+      - name: Install all locked project extras
+        id: dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --all-extras --locked --python 3.12 2>&1 | tee "$GATE_LOG_DIR/dependencies.log"
+          {
+            .venv/bin/python --version
+            uv --version
+            node --version
+            uv pip freeze --python .venv/bin/python
+          } > "$GATE_LOG_DIR/dependency-versions.txt" 2>&1
+      - name: make lint
+        id: lint
+        if: ${{ always() && steps.dependencies.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          make PYTHON="$GITHUB_WORKSPACE/.venv/bin/python" lint 2>&1 | tee "$GATE_LOG_DIR/lint.log"
+      - name: make test
+        id: test
+        if: ${{ always() && steps.dependencies.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          make PYTHON="$GITHUB_WORKSPACE/.venv/bin/python" test 2>&1 | tee "$GATE_LOG_DIR/test.log"
+      - name: make build
+        id: build
+        if: ${{ always() && steps.dependencies.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          make PYTHON="$GITHUB_WORKSPACE/.venv/bin/python" build 2>&1 | tee "$GATE_LOG_DIR/build.log"
+      - name: Record exact-head gate outcomes
+        if: ${{ always() }}
+        env:
+          TARGET_ID: ${{ matrix.id }}
+          EXPECTED_SHA: ${{ matrix.sha }}
+          ACTUAL_SHA: ${{ steps.identity.outputs.sha }}
+          INSTALL_OUTCOME: ${{ steps.dependencies.outcome }}
+          LINT_OUTCOME: ${{ steps.lint.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        shell: bash
+        run: |
+          python3 - <<'PYRECEIPT'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+          gates = {name: os.environ[name.upper() + "_OUTCOME"] for name in ("lint", "test", "build")}
+          receipt = {
+              "target": os.environ["TARGET_ID"],
+              "expected_sha": os.environ["EXPECTED_SHA"],
+              "actual_sha": os.environ["ACTUAL_SHA"],
+              "installation": os.environ["INSTALL_OUTCOME"],
+              "gates": gates,
+              "runner": "ubuntu-24.04",
+              "python": "3.12",
+              "uv": "0.13.8",
+              "tmpdir": "/tmp",
+              "test_command": 'make PYTHON="$GITHUB_WORKSPACE/.venv/bin/python" test',
+              "test_selection": "Unmodified project pytest defaults; no additional skips or exclusions",
+              "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+              "run_url": f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+          }
+          receipt["passed"] = (
+              receipt["actual_sha"] == receipt["expected_sha"]
+              and receipt["installation"] == "success"
+              and all(outcome == "success" for outcome in gates.values())
+          )
+          directory = Path(os.environ["GATE_LOG_DIR"])
+          directory.mkdir(parents=True, exist_ok=True)
+          (directory / "receipt.json").write_text(json.dumps(receipt, indent=2) + "\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(f"## {receipt['target']}\n\n")
+              summary.write(f"Commit: `{receipt['actual_sha']}`\n\n")
+              summary.write("| Gate | Outcome |\n|---|---|\n")
+              for name, outcome in gates.items():
+                  summary.write(f"| `make {name}` | {outcome} |\n")
+              summary.write("\nFresh Ubuntu checkout with the repository's locked dependencies and original tests.\n")
+          if not receipt["passed"]:
+              raise SystemExit("One or more required gates did not pass for the expected head")
+          PYRECEIPT
+      - name: Upload gate logs and receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2, matching upstream
+        with:
+          name: skillevaluator-preflight-${{ matrix.id }}
+          path: ${{ env.GATE_LOG_DIR }}/
+          if-no-files-found: warn
+          retention-days: 14
