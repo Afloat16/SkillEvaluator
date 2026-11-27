@@ -36,6 +36,9 @@ All notable changes to SkillEvaluator are documented in this file.
 
 ### Fixed
 
+- The bundled task-list skill's `list` and `next` operations leave task state
+  unchanged. A query no longer creates or rewrites the state file, or overwrites
+  a task update saved after the query read its snapshot.
 - `make lint` checks the whole repository, as CI does, instead of only `src` and `tests`, so a
   lint error in `scripts/` or `ci/` no longer passes the documented local gate and then fails CI.
 - Tier 2 deduplication verdict requests carry the documented output ceiling,

@@ -9,7 +9,9 @@ import importlib.util
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from types import ModuleType
 from typing import ClassVar
 
@@ -78,6 +80,67 @@ def test_task_content_containing_error_label_remains_successful(tmp_path: Path) 
     assert result.returncode == 0
     assert result.stdout == "Added [task_1]: Investigate Error: logs\n"
     assert result.stderr == ""
+
+
+@pytest.mark.parametrize("operation", ["list", "next"])
+def test_task_queries_do_not_create_state(operation: str, tmp_path: Path) -> None:
+    state_path = tmp_path / "tasks" / "todo.md"
+
+    result = _run_script("tasks", operation, env={"TASK_LIST_STATE_PATH": str(state_path)})
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert not state_path.parent.exists()
+
+
+@pytest.mark.parametrize("operation", ["list", "next"])
+def test_task_queries_leave_state_unchanged(operation: str, tmp_path: Path) -> None:
+    state_path = tmp_path / "todo.md"
+    content = "# Work\n\n- [ ] task_1: Review (pending)\n"
+    state_path.write_text(content, encoding="utf-8")
+    os.utime(state_path, ns=(1_000_000_000, 1_000_000_000))
+    before = state_path.stat()
+
+    result = _run_script("tasks", operation, env={"TASK_LIST_STATE_PATH": str(state_path)})
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert "Review" in result.stdout
+    assert state_path.read_text(encoding="utf-8") == content
+    assert state_path.stat().st_mtime_ns == before.st_mtime_ns
+
+
+@pytest.mark.parametrize("operation", ["list", "next"])
+def test_task_queries_preserve_interleaved_updates(
+    operation: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    reader, writer = _load_script("tasks"), _load_script("tasks")
+    state_path = tmp_path / "todo.md"
+    assert writer._execute_operation("add", None, "Original", state_path)["total_tasks"] == 1
+    load_state = reader._load_state
+    snapshot_loaded, update_saved = Event(), Event()
+
+    def load_before_update(path: Path) -> tuple[dict, str | None]:
+        state, error = load_state(path)
+        snapshot_loaded.set()
+        assert update_saved.wait(timeout=5)
+        return state, error
+
+    monkeypatch.setattr(reader, "_load_state", load_before_update)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        query = executor.submit(reader._execute_operation, operation, None, None, state_path)
+        try:
+            assert snapshot_loaded.wait(timeout=5)
+            added = writer._execute_operation("add", None, "Added during query", state_path)
+            assert added["total_tasks"] == 2
+        finally:
+            update_saved.set()
+        assert query.result(timeout=5)["operation"] == operation
+
+    state, error = writer._load_state(state_path)
+    assert error is None
+    assert set(state["tasks"]) == {"task_1", "task_2"}
+    assert state["tasks"]["task_2"]["content"] == "Added during query"
 
 
 @pytest.mark.parametrize(

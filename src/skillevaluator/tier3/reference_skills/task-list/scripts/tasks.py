@@ -419,7 +419,7 @@ def _execute_operation(operation: str, task_id: str | None, content: str | None,
         return {"error": f"Unknown operation '{operation}'. Use: {valid_ops}"}
 
     result = operations[operation]()
-    if "error" not in result:
+    if "error" not in result and operation not in {"list", "next"}:
         save_error = _save_state(state_path, state)
         if save_error:
             return {"error": save_error}
